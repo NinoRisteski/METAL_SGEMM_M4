@@ -3,3 +3,4 @@
 #### https://github.com/bkvogel/metal_performance_testing.git
 #### https://developer.apple.com/videos/play/tech-talks/10858/
 #### https://arxiv.org/html/2502.05317v1
+#### https://developer.apple.com/documentation/xcode/optimizing-gpu-performance
