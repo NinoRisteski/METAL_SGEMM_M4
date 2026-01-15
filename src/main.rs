@@ -1,8 +1,10 @@
-use anyhow::{anyhow, Context, Result};
-use metal::{Device, MTLResourceOptions, MTLSize};
+use anyhow::{anyhow, Result};
+use metal::{Buffer, ComputePipelineState, Device, MTLResourceOptions, MTLSize};
+use rand::Rng;
+use std::collections::HashMap;
+use std::io::Write;
 use std::mem;
-use std::path::Path;
-use std::slice;
+use std::time::Instant;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -12,114 +14,87 @@ struct MatrixDims {
     k: u32,
 }
 
-const SHADER_PATH: &str = "shaders/sgemm.metal";
-const MATRIX_SIZE: usize = 64;
+// ============================================================================
+// Kernel registry - add new kernels here
+// ============================================================================
 
-fn main() -> Result<()> {
-    let device = Device::system_default().ok_or_else(|| anyhow!("Metal device unavailable"))?;
-    println!("Using Metal device: {}", device.name());
+struct Kernel {
+    name: &'static str,
+    shader_path: &'static str,
+    function_name: &'static str,
+}
 
-    let shader_source = std::fs::read_to_string(Path::new(SHADER_PATH))
-        .with_context(|| format!("failed to read shader at {SHADER_PATH}"))?;
-    let compile_options = metal::CompileOptions::new();
-    let library = device
-        .new_library_with_source(&shader_source, &compile_options)
-        .map_err(|err| anyhow!("failed to compile Metal shader source: {err}"))?;
-    let function = library
-        .get_function("sgemm", None)
-        .map_err(|err| anyhow!("failed to find `sgemm` kernel: {err}"))?;
-    let pipeline_state = device
-        .new_compute_pipeline_state_with_function(&function)
-        .map_err(|err| anyhow!("failed to create compute pipeline state: {err}"))?;
+const KERNELS: &[Kernel] = &[
+    Kernel {
+        name: "Naive",
+        shader_path: "shaders/sgemm.metal",
+        function_name: "sgemm",
+    },
+    Kernel {
+        name: "Contiguous Global",
+        shader_path: "shaders/contiguous_global.metal",
+        function_name: "sgemm_v1_contig_global",
+    },
+    // Add new kernels here:
+    // Kernel {
+    //     name: "Tiled",
+    //     shader_path: "shaders/tiled.metal",
+    //     function_name: "sgemm_tiled",
+    // },
+];
 
-    let (m, n, k) = (MATRIX_SIZE, MATRIX_SIZE, MATRIX_SIZE);
-    let dims = MatrixDims {
-        m: m as u32,
-        n: n as u32,
-        k: k as u32,
-    };
+// ============================================================================
+// Benchmark configuration
+// ============================================================================
 
-    let a_host = generate_matrix(m, k, 0.01);
-    let b_host = generate_matrix(k, n, 0.02);
-    let cpu_ref = cpu_sgemm(m, n, k, &a_host, &b_host);
+const SIZES_TO_CHECK: &[usize] = &[8, 32, 64, 128, 256];
+const SIZES_TO_BENCH: &[usize] = &[64, 128, 256, 512, 1024, 2048, 4096];
+const WARMUP_ITERS: usize = 3;
+const MIN_BENCH_DURATION_SECS: f64 = 2.0;
+const MAX_BENCH_ITERS: usize = 100;
+const TOLERANCE: f32 = 1e-3;
 
-    let buffer_len_bytes = |len: usize| (len * mem::size_of::<f32>()) as u64;
-    let buffer_a = device.new_buffer_with_data(
-        a_host.as_ptr() as *const _,
-        buffer_len_bytes(a_host.len()),
-        MTLResourceOptions::CPUCacheModeDefaultCache,
+// ============================================================================
+// Matrix utilities
+// ============================================================================
+
+fn generate_random_matrix(device: &Device, rows: usize, cols: usize) -> Buffer {
+    let mut rng = rand::rng();
+    let data: Vec<f32> = (0..rows * cols)
+        .map(|_| rng.random_range(-1.0..1.0))
+        .collect();
+
+    device.new_buffer_with_data(
+        data.as_ptr() as *const _,
+        (data.len() * mem::size_of::<f32>()) as u64,
+        MTLResourceOptions::StorageModeShared,
+    )
+}
+
+fn create_zero_buffer(device: &Device, len: usize) -> Buffer {
+    let buffer = device.new_buffer(
+        (len * mem::size_of::<f32>()) as u64,
+        MTLResourceOptions::StorageModeShared,
     );
-    let buffer_b = device.new_buffer_with_data(
-        b_host.as_ptr() as *const _,
-        buffer_len_bytes(b_host.len()),
-        MTLResourceOptions::CPUCacheModeDefaultCache,
-    );
-    let buffer_c =
-        device.new_buffer(buffer_len_bytes(m * n), MTLResourceOptions::StorageModeShared);
     unsafe {
-        std::ptr::write_bytes(
-            buffer_c.contents(),
-            0,
-            mem::size_of::<f32>() * m * n,
-        );
+        std::ptr::write_bytes(buffer.contents(), 0, len * mem::size_of::<f32>());
     }
-    let dims_buffer = device.new_buffer_with_data(
-        &dims as *const _ as *const _,
-        mem::size_of::<MatrixDims>() as u64,
-        MTLResourceOptions::CPUCacheModeDefaultCache,
-    );
-
-    let command_queue = device.new_command_queue();
-    let command_buffer = command_queue.new_command_buffer();
-    let encoder = command_buffer.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline_state);
-    encoder.set_buffer(0, Some(&buffer_a), 0);
-    encoder.set_buffer(1, Some(&buffer_b), 0);
-    encoder.set_buffer(2, Some(&buffer_c), 0);
-    encoder.set_buffer(3, Some(&dims_buffer), 0);
-
-    let threads_per_threadgroup = MTLSize {
-        width: 8,
-        height: 8,
-        depth: 1,
-    };
-    let grid_size = MTLSize {
-        width: n as u64,
-        height: m as u64,
-        depth: 1,
-    };
-    let threadgroups = MTLSize {
-        width: ceil_div(grid_size.width, threads_per_threadgroup.width),
-        height: ceil_div(grid_size.height, threads_per_threadgroup.height),
-        depth: 1,
-    };
-    encoder.dispatch_thread_groups(threadgroups, threads_per_threadgroup);
-    encoder.end_encoding();
-
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
-
-    let c_result = unsafe {
-        slice::from_raw_parts(buffer_c.contents() as *const f32, m * n).to_vec()
-    };
-
-    let max_diff = c_result
-        .iter()
-        .zip(cpu_ref.iter())
-        .map(|(lhs, rhs)| (lhs - rhs).abs())
-        .fold(0.0_f32, f32::max);
-
-    println!("SGEMM complete for {m}x{n} (k = {k})");
-    println!("Maximum difference vs CPU reference: {max_diff:e}");
-
-    Ok(())
+    buffer
 }
 
-fn generate_matrix(rows: usize, cols: usize, scale: f32) -> Vec<f32> {
-    (0..rows * cols)
-        .map(|idx| (idx as f32 + 1.0) * scale)
-        .collect()
+fn buffer_to_vec(buffer: &Buffer, len: usize) -> Vec<f32> {
+    unsafe { std::slice::from_raw_parts(buffer.contents() as *const f32, len).to_vec() }
 }
+
+fn clear_buffer(buffer: &Buffer, len: usize) {
+    unsafe {
+        std::ptr::write_bytes(buffer.contents(), 0, len * mem::size_of::<f32>());
+    }
+}
+
+// ============================================================================
+// CPU reference implementation
+// ============================================================================
 
 fn cpu_sgemm(m: usize, n: usize, k: usize, a: &[f32], b: &[f32]) -> Vec<f32> {
     let mut c = vec![0.0_f32; m * n];
@@ -135,9 +110,301 @@ fn cpu_sgemm(m: usize, n: usize, k: usize, a: &[f32], b: &[f32]) -> Vec<f32> {
     c
 }
 
-fn ceil_div(num: u64, denom: u64) -> u64 {
-    if denom == 0 {
-        return 0;
+// ============================================================================
+// Pipeline management
+// ============================================================================
+
+fn compile_kernel(device: &Device, kernel: &Kernel) -> Result<ComputePipelineState> {
+    let shader_source = std::fs::read_to_string(kernel.shader_path)
+        .map_err(|e| anyhow!("failed to read {}: {e}", kernel.shader_path))?;
+
+    let compile_options = metal::CompileOptions::new();
+    let library = device
+        .new_library_with_source(&shader_source, &compile_options)
+        .map_err(|e| anyhow!("failed to compile {}: {e}", kernel.shader_path))?;
+
+    let function = library
+        .get_function(kernel.function_name, None)
+        .map_err(|e| anyhow!("failed to find function {}: {e}", kernel.function_name))?;
+
+    device
+        .new_compute_pipeline_state_with_function(&function)
+        .map_err(|e| anyhow!("failed to create pipeline for {}: {e}", kernel.name))
+}
+
+fn compile_all_kernels(device: &Device) -> Result<HashMap<&'static str, ComputePipelineState>> {
+    let mut pipelines = HashMap::new();
+    for kernel in KERNELS {
+        let pipeline = compile_kernel(device, kernel)?;
+        pipelines.insert(kernel.name, pipeline);
     }
-    (num + denom - 1) / denom
+    Ok(pipelines)
+}
+
+// ============================================================================
+// Kernel execution
+// ============================================================================
+
+fn run_kernel(
+    command_queue: &metal::CommandQueue,
+    pipeline: &ComputePipelineState,
+    buffer_a: &Buffer,
+    buffer_b: &Buffer,
+    buffer_c: &Buffer,
+    dims_buffer: &Buffer,
+    m: usize,
+    n: usize,
+) {
+    let threads_per_threadgroup = MTLSize {
+        width: 8,
+        height: 8,
+        depth: 1,
+    };
+    let threadgroups = MTLSize {
+        width: (n as u64 + 7) / 8,
+        height: (m as u64 + 7) / 8,
+        depth: 1,
+    };
+
+    let command_buffer = command_queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(buffer_a), 0);
+    encoder.set_buffer(1, Some(buffer_b), 0);
+    encoder.set_buffer(2, Some(buffer_c), 0);
+    encoder.set_buffer(3, Some(dims_buffer), 0);
+    encoder.dispatch_thread_groups(threadgroups, threads_per_threadgroup);
+    encoder.end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+}
+
+// ============================================================================
+// Correctness checking
+// ============================================================================
+
+fn check_kernel(
+    device: &Device,
+    command_queue: &metal::CommandQueue,
+    pipeline: &ComputePipelineState,
+    n: usize,
+) -> Result<f32> {
+    let (m, k) = (n, n);
+
+    let buffer_a = generate_random_matrix(device, m, k);
+    let buffer_b = generate_random_matrix(device, k, n);
+    let buffer_c = create_zero_buffer(device, m * n);
+
+    let dims = MatrixDims {
+        m: m as u32,
+        n: n as u32,
+        k: k as u32,
+    };
+    let dims_buffer = device.new_buffer_with_data(
+        &dims as *const _ as *const _,
+        mem::size_of::<MatrixDims>() as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+
+    run_kernel(
+        command_queue,
+        pipeline,
+        &buffer_a,
+        &buffer_b,
+        &buffer_c,
+        &dims_buffer,
+        m,
+        n,
+    );
+
+    let gpu_result = buffer_to_vec(&buffer_c, m * n);
+    let a_vec = buffer_to_vec(&buffer_a, m * k);
+    let b_vec = buffer_to_vec(&buffer_b, k * n);
+    let cpu_result = cpu_sgemm(m, n, k, &a_vec, &b_vec);
+
+    let max_diff = gpu_result
+        .iter()
+        .zip(cpu_result.iter())
+        .map(|(g, c)| (g - c).abs())
+        .max_by(f32::total_cmp)
+        .unwrap_or(0.0);
+
+    Ok(max_diff)
+}
+
+fn run_checks(
+    device: &Device,
+    command_queue: &metal::CommandQueue,
+    pipelines: &HashMap<&'static str, ComputePipelineState>,
+) -> Result<()> {
+    println!("=== Correctness Checks ===\n");
+
+    for kernel in KERNELS {
+        let pipeline = pipelines.get(kernel.name).unwrap();
+        print!("{:20} ", kernel.name);
+        std::io::stdout().flush()?;
+
+        let mut all_passed = true;
+        for &sz in SIZES_TO_CHECK {
+            let diff = check_kernel(device, command_queue, pipeline, sz)?;
+            if diff.is_nan() || diff > TOLERANCE {
+                print!("FAIL({sz}:{diff:.2e}) ");
+                all_passed = false;
+            }
+        }
+        if all_passed {
+            println!("OK (all sizes passed, tol={TOLERANCE:.0e})");
+        } else {
+            println!();
+        }
+    }
+    println!();
+    Ok(())
+}
+
+// ============================================================================
+// Benchmarking
+// ============================================================================
+
+fn bench_kernel(
+    device: &Device,
+    command_queue: &metal::CommandQueue,
+    pipeline: &ComputePipelineState,
+    n: usize,
+) -> Result<f64> {
+    let (m, k) = (n, n);
+
+    let buffer_a = generate_random_matrix(device, m, k);
+    let buffer_b = generate_random_matrix(device, k, n);
+    let buffer_c = create_zero_buffer(device, m * n);
+
+    let dims = MatrixDims {
+        m: m as u32,
+        n: n as u32,
+        k: k as u32,
+    };
+    let dims_buffer = device.new_buffer_with_data(
+        &dims as *const _ as *const _,
+        mem::size_of::<MatrixDims>() as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+
+    // Warmup
+    for _ in 0..WARMUP_ITERS {
+        run_kernel(
+            command_queue,
+            pipeline,
+            &buffer_a,
+            &buffer_b,
+            &buffer_c,
+            &dims_buffer,
+            m,
+            n,
+        );
+    }
+
+    // Time-based benchmarking
+    let mut iterations = 0;
+    let start = Instant::now();
+    loop {
+        clear_buffer(&buffer_c, m * n);
+        run_kernel(
+            command_queue,
+            pipeline,
+            &buffer_a,
+            &buffer_b,
+            &buffer_c,
+            &dims_buffer,
+            m,
+            n,
+        );
+        iterations += 1;
+
+        let elapsed = start.elapsed().as_secs_f64();
+        if elapsed >= MIN_BENCH_DURATION_SECS || iterations >= MAX_BENCH_ITERS {
+            let avg_time = elapsed / iterations as f64;
+            let flops = 2.0 * (m as f64) * (n as f64) * (k as f64);
+            let gflops = flops / avg_time / 1e9;
+            return Ok(gflops);
+        }
+    }
+}
+
+fn run_benchmarks(
+    device: &Device,
+    command_queue: &metal::CommandQueue,
+    pipelines: &HashMap<&'static str, ComputePipelineState>,
+) -> Result<()> {
+    println!("=== Benchmark Results (GFLOPS) ===\n");
+
+    // Print header
+    print!("{:20} ", "Kernel");
+    for &sz in SIZES_TO_BENCH {
+        print!("{:>7} ", sz);
+    }
+    println!();
+    print!("{:-<20} ", "");
+    for _ in SIZES_TO_BENCH {
+        print!("{:->7} ", "");
+    }
+    println!();
+
+    // Run benchmarks for each kernel
+    for kernel in KERNELS {
+        let pipeline = pipelines.get(kernel.name).unwrap();
+        print!("{:20} ", kernel.name);
+        std::io::stdout().flush()?;
+
+        for &sz in SIZES_TO_BENCH {
+            let gflops = bench_kernel(device, command_queue, pipeline, sz)?;
+            print!("{:>7.0} ", gflops);
+            std::io::stdout().flush()?;
+        }
+        println!();
+    }
+
+    println!();
+    Ok(())
+}
+
+// ============================================================================
+// Device info
+// ============================================================================
+
+fn print_device_info(device: &Device) {
+    println!("=== Device Information ===\n");
+    println!("Name:                       {}", device.name());
+    println!("Registry ID:                {}", device.registry_id());
+    println!("Is Low Power:               {}", device.is_low_power());
+    println!(
+        "Max Threadgroup Memory:     {} bytes",
+        device.max_threadgroup_memory_length()
+    );
+    println!(
+        "Max Threads per Threadgroup: {:?}",
+        device.max_threads_per_threadgroup()
+    );
+    println!(
+        "Max Buffer Length:          {} MB",
+        device.max_buffer_length() / 1024 / 1024
+    );
+    println!();
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+fn main() -> Result<()> {
+    let device = Device::system_default().ok_or_else(|| anyhow!("No Metal device found"))?;
+
+    print_device_info(&device);
+
+    let pipelines = compile_all_kernels(&device)?;
+    let command_queue = device.new_command_queue();
+
+    run_checks(&device, &command_queue, &pipelines)?;
+    run_benchmarks(&device, &command_queue, &pipelines)?;
+
+    Ok(())
 }
