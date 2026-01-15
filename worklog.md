@@ -1,2 +1,4 @@
-SGEMM complete for 64x64 (k = 64)
-Maximum difference vs CPU reference: 2.34375e-2
+  Kernel                    64     128     256     512    1024    2048    4096
+  -------------------- ------- ------- ------- ------- ------- ------- -------
+  Naive                      1      12      45     192     326     344     313
+  Contiguous Global          3      21     103     247     326     344     325
