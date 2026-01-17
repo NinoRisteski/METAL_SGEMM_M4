@@ -28,8 +28,8 @@ struct Kernel {
 const KERNELS: &[Kernel] = &[
     Kernel {
         name: "Naive",
-        shader_path: "shaders/sgemm.metal",
-        function_name: "sgemm",
+        shader_path: "shaders/naive.metal",
+        function_name: "naive",
         threads_per_threadgroup: MTLSize {
             width: 8,
             height: 8,
