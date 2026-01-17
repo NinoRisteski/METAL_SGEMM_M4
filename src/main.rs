@@ -22,6 +22,7 @@ struct Kernel {
     name: &'static str,
     shader_path: &'static str,
     function_name: &'static str,
+    threads_per_threadgroup: MTLSize,
 }
 
 const KERNELS: &[Kernel] = &[
@@ -29,11 +30,31 @@ const KERNELS: &[Kernel] = &[
         name: "Naive",
         shader_path: "shaders/sgemm.metal",
         function_name: "sgemm",
+        threads_per_threadgroup: MTLSize {
+            width: 8,
+            height: 8,
+            depth: 1,
+        },
     },
     Kernel {
         name: "Contiguous Global",
         shader_path: "shaders/contiguous_global.metal",
         function_name: "sgemm_v1_contig_global",
+        threads_per_threadgroup: MTLSize {
+            width: 8,
+            height: 8,
+            depth: 1,
+        },
+    },
+    Kernel {
+        name: "Threadgroup Tiling",
+        shader_path: "shaders/threadgroup_tiling.metal",
+        function_name: "sgemm_tiled16",
+        threads_per_threadgroup: MTLSize {
+            width: 16,
+            height: 16,
+            depth: 1,
+        },
     },
     // Add new kernels here:
     // Kernel {
@@ -154,15 +175,11 @@ fn run_kernel(
     dims_buffer: &Buffer,
     m: usize,
     n: usize,
+    threads_per_threadgroup: MTLSize,
 ) {
-    let threads_per_threadgroup = MTLSize {
-        width: 8,
-        height: 8,
-        depth: 1,
-    };
     let threadgroups = MTLSize {
-        width: (n as u64 + 7) / 8,
-        height: (m as u64 + 7) / 8,
+        width: (n as u64 + threads_per_threadgroup.width - 1) / threads_per_threadgroup.width,
+        height: (m as u64 + threads_per_threadgroup.height - 1) / threads_per_threadgroup.height,
         depth: 1,
     };
 
@@ -188,6 +205,7 @@ fn check_kernel(
     command_queue: &metal::CommandQueue,
     pipeline: &ComputePipelineState,
     n: usize,
+    threads_per_threadgroup: MTLSize,
 ) -> Result<f32> {
     let (m, k) = (n, n);
 
@@ -215,6 +233,7 @@ fn check_kernel(
         &dims_buffer,
         m,
         n,
+        threads_per_threadgroup,
     );
 
     let gpu_result = buffer_to_vec(&buffer_c, m * n);
@@ -246,7 +265,8 @@ fn run_checks(
 
         let mut all_passed = true;
         for &sz in SIZES_TO_CHECK {
-            let diff = check_kernel(device, command_queue, pipeline, sz)?;
+            let diff =
+                check_kernel(device, command_queue, pipeline, sz, kernel.threads_per_threadgroup)?;
             if diff.is_nan() || diff > TOLERANCE {
                 print!("FAIL({sz}:{diff:.2e}) ");
                 all_passed = false;
@@ -271,6 +291,7 @@ fn bench_kernel(
     command_queue: &metal::CommandQueue,
     pipeline: &ComputePipelineState,
     n: usize,
+    threads_per_threadgroup: MTLSize,
 ) -> Result<f64> {
     let (m, k) = (n, n);
 
@@ -300,6 +321,7 @@ fn bench_kernel(
             &dims_buffer,
             m,
             n,
+            threads_per_threadgroup,
         );
     }
 
@@ -317,6 +339,7 @@ fn bench_kernel(
             &dims_buffer,
             m,
             n,
+            threads_per_threadgroup,
         );
         iterations += 1;
 
@@ -356,7 +379,13 @@ fn run_benchmarks(
         std::io::stdout().flush()?;
 
         for &sz in SIZES_TO_BENCH {
-            let gflops = bench_kernel(device, command_queue, pipeline, sz)?;
+            let gflops = bench_kernel(
+                device,
+                command_queue,
+                pipeline,
+                sz,
+                kernel.threads_per_threadgroup,
+            )?;
             print!("{:>7.0} ", gflops);
             std::io::stdout().flush()?;
         }
