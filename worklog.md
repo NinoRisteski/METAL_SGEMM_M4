@@ -4,7 +4,7 @@ Chip: Apple M4
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Naive | 1 | 12 | 45 | 192 | 326 | 344 | 313 |
 | Contiguous Global | 3 | 21 | 103 | 247 | 326 | 344 | 325 |
-
+| Threadgroup Tiling | 3 | 22 | 119 | 339 | 496 | 533 | 538 |
 TODO:
 | Shader                | GFLOPs/s | Performance relative to MPS |
 | --------------------- | -------: | --------------------------: |
