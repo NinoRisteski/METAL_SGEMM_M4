@@ -31,8 +31,8 @@ const KERNELS: &[Kernel] = &[
         shader_path: "shaders/naive.metal",
         function_name: "naive",
         threads_per_threadgroup: MTLSize {
-            width: 8,
-            height: 8,
+            width: 16,
+            height: 16,
             depth: 1,
         },
     },
@@ -41,8 +41,8 @@ const KERNELS: &[Kernel] = &[
         shader_path: "shaders/contiguous_global.metal",
         function_name: "sgemm_v1_contig_global",
         threads_per_threadgroup: MTLSize {
-            width: 8,
-            height: 8,
+            width: 16,
+            height: 16,
             depth: 1,
         },
     },
