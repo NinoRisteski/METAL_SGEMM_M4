@@ -6,9 +6,9 @@
 
 | Kernel | 64 | 128 | 256 | 512 | 1024 | 2048 | 4096 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Naive | 2 | 11 | 64 | 208 | 307 | 301 | 271 |
-| Contiguous Global | 3 | 18 | 99 | 243 | 315 | 342 | 305 |
-| Threadgroup Tiling | 3 | 21 | 115 | 321 | 497 | 533 | 539 |
+| Naive | 2 | 20 | 94 | 253 | 327 | 352 | 322 |
+| Contiguous Global | 2 | 18 | 102 | 256 | 325 | 352 | 348 |
+| Threadgroup Tiling | 4 | 24 | 129 | 376 | 478 | 532 | 534 |
 
 
 | Kernel | GFLOPs/s | Performance vs MPS |
