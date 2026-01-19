@@ -14,8 +14,8 @@ kernel void naive(const device float *A [[buffer(0)]],
                                 constant MatrixDims &dims [[buffer(3)]],
                                 uint2 gid [[thread_position_in_grid]])
 {
-    const uint row = gid.x;
-    const uint col = gid.y;
+    const uint row = gid.y;
+    const uint col = gid.x;
 
     if (row >= dims.m || col >= dims.n) return;
 
