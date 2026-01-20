@@ -9,6 +9,7 @@
 | Naive | 2 | 13 | 39 | 217 | 332 | 353 | 350 |
 | Contiguous Global | 2 | 17 | 102 | 247 | 332 | 353 | 355 |
 | Threadgroup Tiling | 3 | 20 | 110 | 337 | 497 | 533 | 538 |
+| 1D Microtile | 3 | 20 | 121 | 377 | 713 | 797 | 792 |
 
 
 | Kernel | GFLOPs/s | Performance vs MPS |
