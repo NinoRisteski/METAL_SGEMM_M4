@@ -23,6 +23,9 @@ struct Kernel {
     shader_path: &'static str,
     function_name: &'static str,
     threads_per_threadgroup: MTLSize,
+    /// Output elements per threadgroup (width=N, height=M).
+    /// If None, defaults to threads_per_threadgroup (1 output per thread).
+    output_tile: Option<MTLSize>,
 }
 
 const KERNELS: &[Kernel] = &[
@@ -35,6 +38,7 @@ const KERNELS: &[Kernel] = &[
             height: 16,
             depth: 1,
         },
+        output_tile: None,
     },
     Kernel {
         name: "Contiguous Global",
@@ -45,6 +49,7 @@ const KERNELS: &[Kernel] = &[
             height: 16,
             depth: 1,
         },
+        output_tile: None,
     },
     Kernel {
         name: "Threadgroup Tiling",
@@ -55,13 +60,24 @@ const KERNELS: &[Kernel] = &[
             height: 16,
             depth: 1,
         },
+        output_tile: None,
     },
-    // Add new kernels here:
-    // Kernel {
-    //     name: "Tiled",
-    //     shader_path: "shaders/tiled.metal",
-    //     function_name: "sgemm_tiled",
-    // },
+    Kernel {
+        name: "1D Microtile",
+        shader_path: "shaders/microtile_1d.metal",
+        function_name: "sgemm_microtile_1d",
+        threads_per_threadgroup: MTLSize {
+            width: 16,
+            height: 16,
+            depth: 1,
+        },
+        // BM=16 rows, BN=128 cols per threadgroup
+        output_tile: Some(MTLSize {
+            width: 128,
+            height: 16,
+            depth: 1,
+        }),
+    },
 ];
 
 // ============================================================================
@@ -176,10 +192,13 @@ fn run_kernel(
     m: usize,
     n: usize,
     threads_per_threadgroup: MTLSize,
+    output_tile: Option<MTLSize>,
 ) {
+    // Use output_tile for grid calculation if specified, otherwise use threads_per_threadgroup
+    let tile = output_tile.unwrap_or(threads_per_threadgroup);
     let threadgroups = MTLSize {
-        width: (n as u64 + threads_per_threadgroup.width - 1) / threads_per_threadgroup.width,
-        height: (m as u64 + threads_per_threadgroup.height - 1) / threads_per_threadgroup.height,
+        width: (n as u64 + tile.width - 1) / tile.width,
+        height: (m as u64 + tile.height - 1) / tile.height,
         depth: 1,
     };
 
@@ -206,6 +225,7 @@ fn check_kernel(
     pipeline: &ComputePipelineState,
     n: usize,
     threads_per_threadgroup: MTLSize,
+    output_tile: Option<MTLSize>,
 ) -> Result<f32> {
     let (m, k) = (n, n);
 
@@ -234,6 +254,7 @@ fn check_kernel(
         m,
         n,
         threads_per_threadgroup,
+        output_tile,
     );
 
     let gpu_result = buffer_to_vec(&buffer_c, m * n);
@@ -266,7 +287,7 @@ fn run_checks(
         let mut all_passed = true;
         for &sz in SIZES_TO_CHECK {
             let diff =
-                check_kernel(device, command_queue, pipeline, sz, kernel.threads_per_threadgroup)?;
+                check_kernel(device, command_queue, pipeline, sz, kernel.threads_per_threadgroup, kernel.output_tile)?;
             if diff.is_nan() || diff > TOLERANCE {
                 print!("FAIL({sz}:{diff:.2e}) ");
                 all_passed = false;
@@ -292,6 +313,7 @@ fn bench_kernel(
     pipeline: &ComputePipelineState,
     n: usize,
     threads_per_threadgroup: MTLSize,
+    output_tile: Option<MTLSize>,
 ) -> Result<f64> {
     let (m, k) = (n, n);
 
@@ -322,6 +344,7 @@ fn bench_kernel(
             m,
             n,
             threads_per_threadgroup,
+            output_tile,
         );
     }
 
@@ -340,6 +363,7 @@ fn bench_kernel(
             m,
             n,
             threads_per_threadgroup,
+            output_tile,
         );
         iterations += 1;
 
@@ -385,6 +409,7 @@ fn run_benchmarks(
                 pipeline,
                 sz,
                 kernel.threads_per_threadgroup,
+                kernel.output_tile,
             )?;
             print!("{:>7.0} ", gflops);
             std::io::stdout().flush()?;
