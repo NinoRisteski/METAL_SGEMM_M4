@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use metal::{Buffer, ComputePipelineState, Device, MTLResourceOptions, MTLSize};
 use rand::Rng;
 use std::collections::HashMap;
@@ -78,13 +78,29 @@ const KERNELS: &[Kernel] = &[
             depth: 1,
         }),
     },
+    Kernel {
+        name: "2D Microtile",
+        shader_path: "shaders/microtile_2d.metal",
+        function_name: "sgemm_microtile_2d",
+        threads_per_threadgroup: MTLSize {
+            width: 16,
+            height: 16,
+            depth: 1,
+        },
+        // BM=64 rows, BN=64 cols per threadgroup
+        output_tile: Some(MTLSize {
+            width: 64,
+            height: 64,
+            depth: 1,
+        }),
+    },
 ];
 
 // ============================================================================
 // Benchmark configuration
 // ============================================================================
 
-const SIZES_TO_CHECK: &[usize] = &[8, 32, 64, 128, 256];
+const SIZES_TO_CHECK: &[usize] = &[8, 31, 32, 64, 127, 128, 256, 257];
 const SIZES_TO_BENCH: &[usize] = &[64, 128, 256, 512, 1024, 2048, 4096];
 const WARMUP_ITERS: usize = 3;
 const MIN_BENCH_DURATION_SECS: f64 = 2.0;
@@ -286,8 +302,14 @@ fn run_checks(
 
         let mut all_passed = true;
         for &sz in SIZES_TO_CHECK {
-            let diff =
-                check_kernel(device, command_queue, pipeline, sz, kernel.threads_per_threadgroup, kernel.output_tile)?;
+            let diff = check_kernel(
+                device,
+                command_queue,
+                pipeline,
+                sz,
+                kernel.threads_per_threadgroup,
+                kernel.output_tile,
+            )?;
             if diff.is_nan() || diff > TOLERANCE {
                 print!("FAIL({sz}:{diff:.2e}) ");
                 all_passed = false;
