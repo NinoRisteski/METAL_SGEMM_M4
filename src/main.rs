@@ -139,12 +139,6 @@ fn buffer_to_vec(buffer: &Buffer, len: usize) -> Vec<f32> {
     unsafe { std::slice::from_raw_parts(buffer.contents() as *const f32, len).to_vec() }
 }
 
-fn clear_buffer(buffer: &Buffer, len: usize) {
-    unsafe {
-        std::ptr::write_bytes(buffer.contents(), 0, len * mem::size_of::<f32>());
-    }
-}
-
 // ============================================================================
 // CPU reference implementation
 // ============================================================================
@@ -374,7 +368,6 @@ fn bench_kernel(
     let mut iterations = 0;
     let start = Instant::now();
     loop {
-        clear_buffer(&buffer_c, m * n);
         run_kernel(
             command_queue,
             pipeline,
