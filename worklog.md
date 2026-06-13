@@ -11,6 +11,7 @@
 | Threadgroup Tiling | 3 | 21 | 129 | 336 | 501 | 529 | 540 |
 | 1D Microtile | 4 | 24 | 154 | 467 | 708 | 785 | 778 |
 | 2D Microtile | 2 | 17 | 136 | 611 | 1241 | 1501 | 1516 |
+| 2D Microtile Vec4 | 3 | 18 | 139 | 659 | 1292 | 1520 | 1504 |
 
 
 | Kernel | GFLOPs/s | Performance vs MPS |
@@ -20,7 +21,7 @@
 | -v2 Threadgroup tiling | ... | ...% |
 | v3 1D microtile | ... | ...% |
 | v4 2D microtile | 1516 | ...% |
-| v5 Vector loads | ... | ...% |
+| v5 Vector loads | 1504 | ...% |
 | v6 Pad TG tiles | ... | ...% |
 | v7 Double buffer | ... | ...% |
 | v8 Simdgroup-aware | ... | ...% |

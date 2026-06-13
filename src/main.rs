@@ -94,6 +94,22 @@ const KERNELS: &[Kernel] = &[
             depth: 1,
         }),
     },
+    Kernel {
+        name: "2D Microtile Vec4",
+        shader_path: "shaders/microtile_2d_vec4.metal",
+        function_name: "sgemm_microtile_2d_vec4",
+        threads_per_threadgroup: MTLSize {
+            width: 16,
+            height: 16,
+            depth: 1,
+        },
+        // BM=64 rows, BN=64 cols per threadgroup
+        output_tile: Some(MTLSize {
+            width: 64,
+            height: 64,
+            depth: 1,
+        }),
+    },
 ];
 
 // ============================================================================
