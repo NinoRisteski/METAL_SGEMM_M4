@@ -1,10 +1,23 @@
+#![allow(unexpected_cfgs)]
+
 use anyhow::{Result, anyhow};
-use metal::{Buffer, ComputePipelineState, Device, MTLResourceOptions, MTLSize};
+use metal::NSUInteger;
+use metal::{
+    Buffer, CaptureDescriptor, CaptureManager, ComputePipelineState, Device, MTLCaptureDestination,
+    MTLResourceOptions, MTLSize,
+};
+use objc::runtime::{NO, Object};
+use objc::{class, msg_send, sel, sel_impl};
 use rand::Rng;
 use std::collections::HashMap;
 use std::io::Write;
 use std::mem;
 use std::time::Instant;
+
+#[link(name = "MetalPerformanceShaders", kind = "framework")]
+unsafe extern "C" {}
+
+const MPS_DATA_TYPE_FLOAT32: NSUInteger = 0x10000000 | 32;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -158,6 +171,21 @@ const KERNELS: &[Kernel] = &[
             depth: 1,
         }),
     },
+    Kernel {
+        name: "Simdgroup 8x8",
+        shader_path: "shaders/simdgroup_8x8.metal",
+        function_name: "sgemm_simdgroup_8x8",
+        threads_per_threadgroup: MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        },
+        output_tile: Some(MTLSize {
+            width: 8,
+            height: 8,
+            depth: 1,
+        }),
+    },
 ];
 
 // ============================================================================
@@ -176,11 +204,16 @@ const TOLERANCE: f32 = 1e-3;
 // ============================================================================
 
 fn generate_random_matrix(device: &Device, rows: usize, cols: usize) -> Buffer {
-    let mut rng = rand::rng();
-    let data: Vec<f32> = (0..rows * cols)
-        .map(|_| rng.random_range(-1.0..1.0))
-        .collect();
+    let data = generate_random_vec(rows * cols);
+    buffer_from_vec(device, &data)
+}
 
+fn generate_random_vec(len: usize) -> Vec<f32> {
+    let mut rng = rand::rng();
+    (0..len).map(|_| rng.random_range(-1.0..1.0)).collect()
+}
+
+fn buffer_from_vec(device: &Device, data: &[f32]) -> Buffer {
     device.new_buffer_with_data(
         data.as_ptr() as *const _,
         (data.len() * mem::size_of::<f32>()) as u64,
@@ -219,6 +252,180 @@ fn cpu_sgemm(m: usize, n: usize, k: usize, a: &[f32], b: &[f32]) -> Vec<f32> {
         }
     }
     c
+}
+
+// ============================================================================
+// MPS baseline helpers
+// ============================================================================
+
+struct MpsMatrix {
+    object: *mut Object,
+    buffer: Buffer,
+    rows: usize,
+    cols: usize,
+    row_bytes: usize,
+}
+
+impl Drop for MpsMatrix {
+    fn drop(&mut self) {
+        unsafe {
+            let _: () = msg_send![self.object, release];
+        }
+    }
+}
+
+struct MpsMatmul {
+    object: *mut Object,
+}
+
+impl Drop for MpsMatmul {
+    fn drop(&mut self) {
+        unsafe {
+            let _: () = msg_send![self.object, release];
+        }
+    }
+}
+
+fn mps_row_bytes(cols: usize) -> usize {
+    unsafe {
+        let descriptor_cls = class!(MPSMatrixDescriptor);
+        let row_bytes: NSUInteger = msg_send![
+            descriptor_cls,
+            rowBytesFromColumns: cols as NSUInteger
+            dataType: MPS_DATA_TYPE_FLOAT32
+        ];
+        row_bytes as usize
+    }
+}
+
+fn create_mps_matrix_from_dense(
+    device: &Device,
+    rows: usize,
+    cols: usize,
+    dense: &[f32],
+) -> Result<MpsMatrix> {
+    if dense.len() != rows * cols {
+        return Err(anyhow!(
+            "dense matrix has {} elements, expected {}",
+            dense.len(),
+            rows * cols
+        ));
+    }
+
+    let row_bytes = mps_row_bytes(cols);
+    let row_stride = row_bytes / mem::size_of::<f32>();
+    let mut padded = vec![0.0_f32; rows * row_stride];
+    for row in 0..rows {
+        let dense_start = row * cols;
+        let padded_start = row * row_stride;
+        padded[padded_start..padded_start + cols]
+            .copy_from_slice(&dense[dense_start..dense_start + cols]);
+    }
+
+    let buffer = buffer_from_vec(device, &padded);
+    create_mps_matrix_with_buffer(device, rows, cols, row_bytes, buffer)
+}
+
+fn create_zero_mps_matrix(device: &Device, rows: usize, cols: usize) -> Result<MpsMatrix> {
+    let row_bytes = mps_row_bytes(cols);
+    let row_stride = row_bytes / mem::size_of::<f32>();
+    let buffer = create_zero_buffer(device, rows * row_stride);
+    create_mps_matrix_with_buffer(device, rows, cols, row_bytes, buffer)
+}
+
+fn create_mps_matrix_with_buffer(
+    _device: &Device,
+    rows: usize,
+    cols: usize,
+    row_bytes: usize,
+    buffer: Buffer,
+) -> Result<MpsMatrix> {
+    unsafe {
+        let descriptor_cls = class!(MPSMatrixDescriptor);
+        let descriptor: *mut Object = msg_send![
+            descriptor_cls,
+            matrixDescriptorWithRows: rows as NSUInteger
+            columns: cols as NSUInteger
+            rowBytes: row_bytes as NSUInteger
+            dataType: MPS_DATA_TYPE_FLOAT32
+        ];
+        if descriptor.is_null() {
+            return Err(anyhow!("failed to create MPSMatrixDescriptor"));
+        }
+
+        let matrix_alloc: *mut Object = msg_send![class!(MPSMatrix), alloc];
+        let matrix: *mut Object = msg_send![
+            matrix_alloc,
+            initWithBuffer: buffer.as_ref()
+            descriptor: descriptor
+        ];
+        if matrix.is_null() {
+            return Err(anyhow!("failed to create MPSMatrix"));
+        }
+
+        Ok(MpsMatrix {
+            object: matrix,
+            buffer,
+            rows,
+            cols,
+            row_bytes,
+        })
+    }
+}
+
+fn create_mps_matmul(device: &Device, m: usize, n: usize, k: usize) -> Result<MpsMatmul> {
+    unsafe {
+        let matmul_alloc: *mut Object = msg_send![class!(MPSMatrixMultiplication), alloc];
+        let matmul: *mut Object = msg_send![
+            matmul_alloc,
+            initWithDevice: device.as_ref()
+            transposeLeft: NO
+            transposeRight: NO
+            resultRows: m as NSUInteger
+            resultColumns: n as NSUInteger
+            interiorColumns: k as NSUInteger
+            alpha: 1.0_f64
+            beta: 0.0_f64
+        ];
+        if matmul.is_null() {
+            return Err(anyhow!("failed to create MPSMatrixMultiplication"));
+        }
+        Ok(MpsMatmul { object: matmul })
+    }
+}
+
+fn run_mps_matmul(
+    command_queue: &metal::CommandQueue,
+    matmul: &MpsMatmul,
+    a: &MpsMatrix,
+    b: &MpsMatrix,
+    c: &MpsMatrix,
+) {
+    let command_buffer = command_queue.new_command_buffer();
+    unsafe {
+        let _: () = msg_send![
+            matmul.object,
+            encodeToCommandBuffer: command_buffer
+            leftMatrix: a.object
+            rightMatrix: b.object
+            resultMatrix: c.object
+        ];
+    }
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+}
+
+fn mps_matrix_to_dense(matrix: &MpsMatrix) -> Vec<f32> {
+    let row_stride = matrix.row_bytes / mem::size_of::<f32>();
+    let padded = buffer_to_vec(&matrix.buffer, matrix.rows * row_stride);
+    let mut dense = vec![0.0_f32; matrix.rows * matrix.cols];
+    for row in 0..matrix.rows {
+        let dense_start = row * matrix.cols;
+        let padded_start = row * row_stride;
+        dense[dense_start..dense_start + matrix.cols]
+            .copy_from_slice(&padded[padded_start..padded_start + matrix.cols]);
+    }
+    dense
 }
 
 // ============================================================================
@@ -379,8 +586,53 @@ fn run_checks(
             println!();
         }
     }
+    if metal::mps::mps_supports_device(device) {
+        print!("{:20} ", "MPS");
+        std::io::stdout().flush()?;
+
+        let mut all_passed = true;
+        for &sz in SIZES_TO_CHECK {
+            let diff = check_mps(device, command_queue, sz)?;
+            if diff.is_nan() || diff > TOLERANCE {
+                print!("FAIL({sz}:{diff:.2e}) ");
+                all_passed = false;
+            }
+        }
+        if all_passed {
+            println!("OK (all sizes passed, tol={TOLERANCE:.0e})");
+        } else {
+            println!();
+        }
+    } else {
+        println!("{:20} SKIP (MPS unsupported on this device)", "MPS");
+    }
     println!();
     Ok(())
+}
+
+fn check_mps(device: &Device, command_queue: &metal::CommandQueue, n: usize) -> Result<f32> {
+    let (m, k) = (n, n);
+
+    let a_vec = generate_random_vec(m * k);
+    let b_vec = generate_random_vec(k * n);
+    let matrix_a = create_mps_matrix_from_dense(device, m, k, &a_vec)?;
+    let matrix_b = create_mps_matrix_from_dense(device, k, n, &b_vec)?;
+    let matrix_c = create_zero_mps_matrix(device, m, n)?;
+    let matmul = create_mps_matmul(device, m, n, k)?;
+
+    run_mps_matmul(command_queue, &matmul, &matrix_a, &matrix_b, &matrix_c);
+
+    let gpu_result = mps_matrix_to_dense(&matrix_c);
+    let cpu_result = cpu_sgemm(m, n, k, &a_vec, &b_vec);
+
+    let max_diff = gpu_result
+        .iter()
+        .zip(cpu_result.iter())
+        .map(|(g, c)| (g - c).abs())
+        .max_by(f32::total_cmp)
+        .unwrap_or(0.0);
+
+    Ok(max_diff)
 }
 
 // ============================================================================
@@ -456,6 +708,36 @@ fn bench_kernel(
     }
 }
 
+fn bench_mps(device: &Device, command_queue: &metal::CommandQueue, n: usize) -> Result<f64> {
+    let (m, k) = (n, n);
+
+    let a_vec = generate_random_vec(m * k);
+    let b_vec = generate_random_vec(k * n);
+    let matrix_a = create_mps_matrix_from_dense(device, m, k, &a_vec)?;
+    let matrix_b = create_mps_matrix_from_dense(device, k, n, &b_vec)?;
+    let matrix_c = create_zero_mps_matrix(device, m, n)?;
+    let matmul = create_mps_matmul(device, m, n, k)?;
+
+    for _ in 0..WARMUP_ITERS {
+        run_mps_matmul(command_queue, &matmul, &matrix_a, &matrix_b, &matrix_c);
+    }
+
+    let mut iterations = 0;
+    let start = Instant::now();
+    loop {
+        run_mps_matmul(command_queue, &matmul, &matrix_a, &matrix_b, &matrix_c);
+        iterations += 1;
+
+        let elapsed = start.elapsed().as_secs_f64();
+        if elapsed >= MIN_BENCH_DURATION_SECS || iterations >= MAX_BENCH_ITERS {
+            let avg_time = elapsed / iterations as f64;
+            let flops = 2.0 * (m as f64) * (n as f64) * (k as f64);
+            let gflops = flops / avg_time / 1e9;
+            return Ok(gflops);
+        }
+    }
+}
+
 fn run_benchmarks(
     device: &Device,
     command_queue: &metal::CommandQueue,
@@ -496,6 +778,18 @@ fn run_benchmarks(
         println!();
     }
 
+    if metal::mps::mps_supports_device(device) {
+        print!("{:20} ", "MPS");
+        std::io::stdout().flush()?;
+
+        for &sz in SIZES_TO_BENCH {
+            let gflops = bench_mps(device, command_queue, sz)?;
+            print!("{:>7.0} ", gflops);
+            std::io::stdout().flush()?;
+        }
+        println!();
+    }
+
     println!();
     Ok(())
 }
@@ -525,19 +819,108 @@ fn print_device_info(device: &Device) {
 }
 
 // ============================================================================
+// GPU profiling (Xcode / Metal capture)
+// ============================================================================
+
+fn profile_kernel(
+    device: &Device,
+    command_queue: &metal::CommandQueue,
+    pipelines: &HashMap<&'static str, ComputePipelineState>,
+) -> Result<()> {
+    const N: usize = 4096;
+    const KERNEL_NAME: &str = "2D Microtile Vec4";
+
+    let kernel = KERNELS
+        .iter()
+        .find(|k| k.name == KERNEL_NAME)
+        .ok_or_else(|| anyhow!("kernel not found"))?;
+
+    let pipeline = pipelines
+        .get(kernel.name)
+        .ok_or_else(|| anyhow!("pipeline not found"))?;
+
+    let buffer_a = generate_random_matrix(device, N, N);
+    let buffer_b = generate_random_matrix(device, N, N);
+    let buffer_c = create_zero_buffer(device, N * N);
+
+    let dims = MatrixDims {
+        m: N as u32,
+        n: N as u32,
+        k: N as u32,
+    };
+
+    let dims_buffer = device.new_buffer_with_data(
+        &dims as *const _ as *const _,
+        mem::size_of::<MatrixDims>() as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+
+    println!("Profiling {KERNEL_NAME} at {N}x{N}x{N}");
+
+    let run = || {
+        run_kernel(
+            command_queue,
+            pipeline,
+            &buffer_a,
+            &buffer_b,
+            &buffer_c,
+            &dims_buffer,
+            N,
+            N,
+            kernel.threads_per_threadgroup,
+            kernel.output_tile,
+        )
+    };
+
+    // Warmup
+    for _ in 0..5 {
+        run();
+    }
+
+    let capture_manager = CaptureManager::shared();
+
+    let trace_path = "/Users/nino/METAL_SGEMM_M4/sgemm_vec4.gputrace";
+    // Metal refuses to overwrite an existing trace document.
+    let _ = std::fs::remove_dir_all(trace_path);
+
+    let descriptor = CaptureDescriptor::new();
+    descriptor.set_capture_command_queue(command_queue);
+    descriptor.set_destination(MTLCaptureDestination::GpuTraceDocument);
+    descriptor.set_output_url(trace_path);
+
+    println!("Starting GPU capture...");
+    capture_manager
+        .start_capture(&descriptor)
+        .map_err(|e| anyhow!("failed to start capture: {e:?}"))?;
+    run();
+    capture_manager.stop_capture();
+    println!("GPU capture complete: {trace_path}");
+
+    Ok(())
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
 fn main() -> Result<()> {
     let device = Device::system_default().ok_or_else(|| anyhow!("No Metal device found"))?;
+    let args: Vec<String> = std::env::args().collect();
+    let check_only = args.iter().any(|arg| arg == "--check-only");
 
     print_device_info(&device);
 
     let pipelines = compile_all_kernels(&device)?;
     let command_queue = device.new_command_queue();
 
-    run_checks(&device, &command_queue, &pipelines)?;
-    run_benchmarks(&device, &command_queue, &pipelines)?;
+    if args.iter().any(|arg| arg == "--profile") {
+        profile_kernel(&device, &command_queue, &pipelines)?;
+    } else {
+        run_checks(&device, &command_queue, &pipelines)?;
+        if !check_only {
+            run_benchmarks(&device, &command_queue, &pipelines)?;
+        }
+    }
 
     Ok(())
 }
