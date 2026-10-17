@@ -172,6 +172,22 @@ const KERNELS: &[Kernel] = &[
         }),
     },
     Kernel {
+        name: "2D Microtile Vec4 4x2",
+        shader_path: "shaders/microtile_2d_vec4_tm4_tn2.metal",
+        function_name: "sgemm_microtile_2d_vec4_tm4_tn2",
+        threads_per_threadgroup: MTLSize {
+            width: 16,
+            height: 16,
+            depth: 1,
+        },
+        // BM=64 rows, BN=32 cols per threadgroup
+        output_tile: Some(MTLSize {
+            width: 32,
+            height: 64,
+            depth: 1,
+        }),
+    },
+    Kernel {
         name: "Simdgroup 8x8",
         shader_path: "shaders/simdgroup_8x8.metal",
         function_name: "sgemm_simdgroup_8x8",
@@ -828,11 +844,18 @@ fn profile_kernel(
     pipelines: &HashMap<&'static str, ComputePipelineState>,
 ) -> Result<()> {
     const N: usize = 4096;
-    const KERNEL_NAME: &str = "2D Microtile Vec4";
+    const DEFAULT_KERNEL_NAME: &str = "2D Microtile Vec4 4x2";
+    // Optional: `--profile "<kernel name>"` overrides the default.
+    let kernel_name = std::env::args()
+        .skip_while(|a| a != "--profile")
+        .nth(1)
+        .filter(|a| !a.starts_with("--"))
+        .unwrap_or_else(|| DEFAULT_KERNEL_NAME.to_string());
+    let kernel_name = kernel_name.as_str();
 
     let kernel = KERNELS
         .iter()
-        .find(|k| k.name == KERNEL_NAME)
+        .find(|k| k.name == kernel_name)
         .ok_or_else(|| anyhow!("kernel not found"))?;
 
     let pipeline = pipelines
@@ -855,7 +878,7 @@ fn profile_kernel(
         MTLResourceOptions::StorageModeShared,
     );
 
-    println!("Profiling {KERNEL_NAME} at {N}x{N}x{N}");
+    println!("Profiling {kernel_name} at {N}x{N}x{N}");
 
     let run = || {
         run_kernel(
@@ -879,7 +902,9 @@ fn profile_kernel(
 
     let capture_manager = CaptureManager::shared();
 
-    let trace_path = "/Users/nino/METAL_SGEMM_M4/sgemm_vec4.gputrace";
+    let safe_name = kernel_name.replace(' ', "_").replace('×', "x").replace('/', "_");
+    let trace_path = format!("/Users/nino/METAL_SGEMM_M4/{safe_name}.gputrace");
+    let trace_path = trace_path.as_str();
     // Metal refuses to overwrite an existing trace document.
     let _ = std::fs::remove_dir_all(trace_path);
 
