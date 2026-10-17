@@ -188,6 +188,21 @@ const KERNELS: &[Kernel] = &[
         }),
     },
     Kernel {
+        name: "Simdgroup 16x16",
+        shader_path: "shaders/simdgroup_16x16.metal",
+        function_name: "sgemm_simdgroup_16x16",
+        threads_per_threadgroup: MTLSize {
+            width: 128,
+            height: 1,
+            depth: 1,
+        },
+        output_tile: Some(MTLSize {
+            width: 16,
+            height: 16,
+            depth: 1,
+        }),
+    },
+    Kernel {
         name: "Simdgroup 8x8",
         shader_path: "shaders/simdgroup_8x8.metal",
         function_name: "sgemm_simdgroup_8x8",
