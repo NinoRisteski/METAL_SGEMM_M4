@@ -217,6 +217,40 @@ const KERNELS: &[Kernel] = &[
             depth: 1,
         }),
     },
+    Kernel {
+        name: "Simdgroup 32x32 MultiFrag",
+        shader_path: "shaders/simdgroup_32x32_multifrag.metal",
+        function_name: "sgemm_simdgroup_32x32_multifrag",
+
+        threads_per_threadgroup: MTLSize {
+            width: 128,
+            height: 1,
+            depth: 1,
+        },
+
+        output_tile: Some(MTLSize {
+            width: 32,
+            height: 32,
+            depth: 1,
+        }),
+    },
+    Kernel {
+        name: "Simdgroup 32x32 MultiFrag BK16",
+        shader_path: "shaders/simdgroup_32x32_multifrag_bk16.metal",
+        function_name: "sgemm_simdgroup_32x32_multifrag_bk16",
+
+        threads_per_threadgroup: MTLSize {
+            width: 128,
+            height: 1,
+            depth: 1,
+        },
+
+        output_tile: Some(MTLSize {
+            width: 32,
+            height: 32,
+            depth: 1,
+        }),
+    },
 ];
 
 // ============================================================================

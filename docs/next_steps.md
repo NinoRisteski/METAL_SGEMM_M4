@@ -2,7 +2,7 @@
 
 Try these paths next, in this order.
 
-## 1. Add an MPS baseline
+## 1. Add an MPS baseline (done)
 
 Benchmark `MPSMatrixMultiplication` on the same sizes.
 
@@ -42,7 +42,11 @@ Threadgroup tiles:
 
 The goal is to find the best balance between reuse, registers, and occupancy.
 
-## 3. Measure register pressure
+## 3. Measure register pressure (partly done)
+
+Done for 2D Microtile Vec4 (102 regs, ~36% occupancy) and Simdgroup 32x32
+MultiFrag (58 regs, ~53% occupancy). Still to do: 4x2 and MultiFrag BK16.
+Use `--profile "<kernel name>"` to capture traces.
 
 The Vec4, BK, and padding variants are starting to plateau. That may mean the
 kernel is register-limited or occupancy-limited.
@@ -58,7 +62,12 @@ occupancy
 
 Use Xcode GPU Frame Capture or Metal System Trace.
 
-## 4. Try simdgroup-level SGEMM
+## 4. Try simdgroup-level SGEMM (done, first pass)
+
+Result so far: Simdgroup 32x32 MultiFrag BK16 reaches ~1740 GFLOPS at 4096
+(55% of MPS), ahead of the best scalar kernel (~1638). Remaining ideas: float4
+loads into threadgroup memory, a larger fragment grid per simdgroup, double
+buffering.
 
 This is probably the biggest unlock.
 
@@ -132,11 +141,6 @@ correctness pass/fail
 
 ## Best Next Concrete Experiment
 
-Implement simdgroup tiled SGEMM, then compare:
-
-```text
-2D Microtile BK32 vs Simdgroup SGEMM vs MPS
-```
-
-That is likely the path from around `1.5 TFLOPS` toward `2.5-3+ TFLOPS` on base
-M4.
+Profile Simdgroup 32x32 MultiFrag BK16, then try float4 threadgroup loads and
+a 4x2 fragment grid per simdgroup. Compare against MPS (~3.1 TFLOPS at 4096)
+using the same `--profile` flow.
