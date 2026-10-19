@@ -21,7 +21,12 @@
 | Simdgroup 16x16 | 3 | 24 | 140 | 527 | 850 | 925 | 934 |
 | Simdgroup 32x32 MultiFrag (BK8) | 3 | 23 | 160 | 732 | 1422 | 1602 | 1615 |
 | Simdgroup 32x32 MultiFrag BK16 | 3 | 23 | 152 | 712 | 1449 | 1718 | 1740 |
+| Simdgroup 32x32 MultiFrag BK16 Vec4 | 4 | 25 | 156 | 849 | 1951 | 1966 | 2101 |
 | MPS | 3 | 21 | 138 | 814 | 2148 | 3036 | 3164 |
+
+Note: the Vec4 row is from the best of 3 full runs; its 4096 value ranged
+1735-2101 across runs (clock/thermal drift, MPS also varied 2777-3161). Use the
+512-2048 columns for stable comparison.
 
 ## Performance vs MPS (4096)
 
@@ -40,6 +45,7 @@
 | v8 Simdgroup 16x16 | 934 | 30% |
 | v8 Simdgroup 32x32 MultiFrag (BK8) | 1615 | 51% |
 | v8 Simdgroup 32x32 MultiFrag BK16 | 1740 | 55% |
+| v8 Simdgroup 32x32 MultiFrag BK16 Vec4 | ~1735-2101 | ~55-66% |
 | v7 Double buffer | ... | ...% |
 | v9 Autotuned | ... | ...% |
 | v10 Packed B | ... | ...% |
@@ -70,6 +76,18 @@ are not recorded yet.
 - BK8 -> BK16: 8 MMAs per barrier pair. +5% at 4096 (1615 -> 1740), now the
   best kernel at 55% of MPS. Not profiled yet.
 
+- BK16 profile @ 4096 vs BK8: occupancy 52.7% -> 41.5% yet 5% faster.
+  F32 util 44% -> 48%, instruction limiter 78.8% -> 82.8%, device read
+  70 -> 53 GiB/s, threadgroup read/write 278 -> 304 GiB/s. Lesson: more math per
+  barrier pair beats higher occupancy.
+- BK16 Vec4 (float4 global->threadgroup loads, everything else unchanged):
+  +35% at 1024, ~+20% at 4096. Profile @ 4096 vs BK16 scalar: occupancy
+  unchanged (41.5%), F32 utilization 48% -> 62%, F32 limiter 62% -> 73%,
+  instruction limiter 83% -> 68%, device read 53 -> 74 GiB/s, threadgroup read
+  304 -> 387 GiB/s, threadgroup write 304 -> 194 GiB/s. The scalar loader was
+  burning instruction issue slots; wider loads free them for MMA. The kernel is
+  now more F32-limited than instruction-limited.
+
 ### Fixes
 
 - `Simdgroup 16x16`: the edge-output barrier was inside a per-simdgroup
@@ -83,6 +101,7 @@ Without a name it profiles the default in `profile_kernel()`.
 
 ## Next
 
-- Profile MultiFrag BK16 (registers, occupancy, threadgroup bandwidth).
-- float4 loads into threadgroup memory for the simdgroup kernels.
-- Larger per-simdgroup fragment grid (e.g. 4x2 fragments).
+- Larger per-simdgroup fragment grid (e.g. 4x2 fragments) to raise useful MMA
+  work per staged tile; loads are no longer the main lever.
+- Re-measure 4096 with repeated runs / cooldown for a stable figure.
+- Optional: double buffering.
