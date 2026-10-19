@@ -22,6 +22,8 @@
 | Simdgroup 32x32 MultiFrag (BK8) | 3 | 23 | 160 | 732 | 1422 | 1602 | 1615 |
 | Simdgroup 32x32 MultiFrag BK16 | 3 | 23 | 152 | 712 | 1449 | 1718 | 1740 |
 | Simdgroup 32x32 MultiFrag BK16 Vec4 | 4 | 25 | 156 | 849 | 1951 | 1966 | 2101 |
+| Simdgroup 64x32 MultiFrag BK16 Vec4 | 3 | 23 | 151 | 839 | 1743 | 1789 | 1786 |
+| Simdgroup 32x32 MultiFrag BK16 Vec4 DB | 3 | 24 | 160 | 840 | 1991 | 2181 | 2056 |
 | MPS | 3 | 21 | 138 | 814 | 2148 | 3036 | 3164 |
 
 Note: the Vec4 row is from the best of 3 full runs; its 4096 value ranged
@@ -46,7 +48,8 @@ Note: the Vec4 row is from the best of 3 full runs; its 4096 value ranged
 | v8 Simdgroup 32x32 MultiFrag (BK8) | 1615 | 51% |
 | v8 Simdgroup 32x32 MultiFrag BK16 | 1740 | 55% |
 | v8 Simdgroup 32x32 MultiFrag BK16 Vec4 | ~1735-2101 | ~55-66% |
-| v7 Double buffer | ... | ...% |
+| v8 Simdgroup 64x32 MultiFrag BK16 Vec4 (negative) | 1786 | 56% |
+| v7 Double buffer (Simdgroup 32x32 BK16 Vec4 DB, null result) | ~1830-2056 | ~60-65% |
 | v9 Autotuned | ... | ...% |
 | v10 Packed B | ... | ...% |
 | MPS (reference) | 3164 | 100% |
@@ -88,6 +91,36 @@ are not recorded yet.
   burning instruction issue slots; wider loads free them for MMA. The kernel is
   now more F32-limited than instruction-limited.
 
+### 64x32 MultiFrag BK16 Vec4 (negative result)
+
+Each simdgroup holds a 4x2 grid of accumulators (8 MMAs per K-step of 8, 64x32
+tile) instead of 2x2. Correct, but ~10% slower than the 32x32 Vec4 kernel
+(~1780 vs ~1900-2060 at 4096; stable across 3 runs). Profile @ 4096 vs 32x32
+Vec4: occupancy 41.5% -> 20.8%, F32 utilization 61.5% -> 53.7%, ALU 40% ->
+33.6%, instruction limiter 68% -> 44%, device read 73.5 -> 49.4 GiB/s,
+threadgroup read 387 -> 253 GiB/s. The extra accumulator state halves residency
+and the added reuse does not make up for it. Conclusion: 2x2 fragments per
+simdgroup on a 32x32 tile is the better balance; stop increasing fragment count.
+Kernel kept in the repo as a documented experiment.
+
+### 32x32 MultiFrag BK16 Vec4 DB (double buffering, null result)
+
+Two threadgroup buffers for A and B (8 KB); next tile's float4 loads are issued
+into registers before the MMAs and stored into the other buffer afterwards, with
+one barrier per K-tile instead of two. Correct, but within run-to-run noise of
+the non-DB Vec4 kernel at every size (3 runs: 1024 1899-1991 vs 1959-2018,
+2048 2109-2181 vs 2036-2130, 4096 1831-2056 vs 1859-2033).
+
+Profile @ 4096 vs BK16 Vec4: occupancy 41.5% -> 24.95%, ALU utilization 40.0% ->
+48.6%, F32 utilization 61.5% -> 68.6%, F32 limiter 72.8% -> 82.9%, instruction
+limiter 67.7% -> 78.6%, device read 73.5 -> 77.4 GiB/s, threadgroup read 387 ->
+432 GiB/s, threadgroup write 194 -> 216 GiB/s.
+
+Double buffering improved compute utilization but reduced occupancy from ~41.5%
+to ~25% (extra threadgroup buffers plus live prefetch registers). The increased
+latency hiding was offset by the resource pressure, so there is no consistent
+end-to-end speedup. Kernel kept in the repo as a documented experiment.
+
 ### Fixes
 
 - `Simdgroup 16x16`: the edge-output barrier was inside a per-simdgroup
@@ -101,7 +134,9 @@ Without a name it profiles the default in `profile_kernel()`.
 
 ## Next
 
-- Larger per-simdgroup fragment grid (e.g. 4x2 fragments) to raise useful MMA
-  work per staged tile; loads are no longer the main lever.
-- Re-measure 4096 with repeated runs / cooldown for a stable figure.
-- Optional: double buffering.
+- GEMM study is complete enough: best kernel is Simdgroup 32x32 MultiFrag BK16
+  Vec4 (~1.9-2.1 TFLOPS at 4096, ~60-65% of MPS). Larger fragment grids and
+  double buffering both lost to occupancy.
+- Move on to reduction kernels.
+- If revisiting GEMM: re-measure 4096 with repeated runs / cooldown for a
+  stable figure.
